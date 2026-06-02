@@ -345,7 +345,8 @@ class VisionTransformer(nn.Module):
                  tubelet_size=2,
                  use_mean_pooling=True,
                  with_cp=False,
-                 cos_attn=False):
+                 cos_attn=False,
+                 clip_counts=None):
         super().__init__()
         self.num_classes = num_classes
         # num_features for consistency with other models
@@ -393,6 +394,19 @@ class VisionTransformer(nn.Module):
         self.head_dropout = nn.Dropout(head_drop_rate)
         self.head = nn.Linear(
             embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        # Video-level heads: projection per clip count → shared head
+        self.clip_counts = clip_counts
+        if clip_counts is not None and len(clip_counts) > 0:
+            self.video_heads = nn.ModuleDict({
+                str(n): nn.Linear(embed_dim * n, embed_dim)
+                for n in clip_counts
+            })
+            for h in self.video_heads.values():
+                h.weight.data.mul_(init_scale)
+                h.bias.data.mul_(init_scale)
+        else:
+            self.video_heads = None
 
         if use_learnable_pos_emb:
             trunc_normal_(self.pos_embed, std=.02)
@@ -447,11 +461,29 @@ class VisionTransformer(nn.Module):
         else:
             return self.norm(x[:, 0])
 
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head_dropout(x)
-        x = self.head(x)
-        return x
+    def forward(self, x, num_clips=None):
+        if num_clips is None:
+            x = self.forward_features(x)
+            x = self.head_dropout(x)
+            x = self.head(x)
+            return x
+
+        # Video-level: x = (total_clips, C, T, H, W), num_clips = [n1, n2, ...]
+        features = self.forward_features(x)
+        features = self.head_dropout(features)
+
+        logits = []
+        offset = 0
+        for n in num_clips:
+            n_int = n.item() if torch.is_tensor(n) else int(n)
+            feat = features[offset: offset + n_int]
+            feat_cat = feat.reshape(-1)               # (n*768,)
+            projected = self.video_heads[str(n_int)](feat_cat)  # (768,)
+            logit = self.head(projected)               # (2,) shared head
+            logits.append(logit)
+            offset += n_int
+
+        return torch.stack(logits)
 
 
 @register_model

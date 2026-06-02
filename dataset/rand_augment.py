@@ -389,8 +389,8 @@ _RAND_TRANSFORMS = [
     "Sharpness",
     "ShearX",
     "ShearY",
-    "TranslateXRel",
-    "TranslateYRel",
+    # "TranslateXRel",
+    # "TranslateYRel",
 ]
 
 _RAND_INCREASING_TRANSFORMS = [
@@ -407,8 +407,8 @@ _RAND_INCREASING_TRANSFORMS = [
     "SharpnessIncreasing",
     "ShearX",
     "ShearY",
-    "TranslateXRel",
-    "TranslateYRel",
+    # "TranslateXRel",
+    # "TranslateYRel",
 ]
 
 # These experimental weights are based loosely on the relative improvements mentioned in paper.
