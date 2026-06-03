@@ -45,7 +45,8 @@ def get_args():
     p.add_argument("--input_size", default=224, type=int)
     p.add_argument("--drop", type=float, default=0.0)
     p.add_argument("--attn_drop_rate", type=float, default=0.0)
-    p.add_argument("--drop_path", type=float, default=0.1)
+    p.add_argument("--drop_path", type=float, default=0.3)
+    p.add_argument("--head_drop_rate", type=float, default=0.5)
     p.add_argument("--nb_classes", type=int, default=2)
     p.add_argument("--use_mean_pooling", action="store_true", default=True)
     p.add_argument("--with_checkpoint", action="store_true", default=False)
@@ -62,10 +63,10 @@ def get_args():
     p.add_argument("--opt", default="adamw", type=str)
     p.add_argument("--opt_eps", default=1e-8, type=float)
     p.add_argument("--opt_betas", default=None, type=float, nargs="+")
-    p.add_argument("--clip_grad", type=float, default=5.0)
+    p.add_argument("--clip_grad", type=float, default=None)
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--lr", default=5e-5, type=float)
-    p.add_argument("--layer_decay", type=float, default=0.75)
+    p.add_argument("--layer_decay", type=float, default=0.9)
     p.add_argument("--min_lr", default=1e-6, type=float)
     p.add_argument("--warmup_lr", default=1e-8, type=float)
     p.add_argument("--warmup_epochs", default=5, type=int)
@@ -73,7 +74,7 @@ def get_args():
     p.add_argument("--weight_decay_end", default=None, type=float)
 
     # Augmentation
-    p.add_argument("--aa", type=str, default="rand-m7-n4-mstd0.5-inc1")
+    p.add_argument("--aa", type=str, default="rand-m0-n2-mstd0.5-inc1")
     p.add_argument("--train_interpolation", type=str, default="bicubic")
     p.add_argument("--smoothing", type=float, default=0.1)
 
@@ -301,6 +302,7 @@ def main():
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         attn_drop_rate=args.attn_drop_rate,
+        head_drop_rate=args.head_drop_rate,
         use_mean_pooling=args.use_mean_pooling,
         init_scale=args.init_scale,
         with_cp=args.with_checkpoint,
