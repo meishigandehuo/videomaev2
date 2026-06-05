@@ -3,23 +3,27 @@ Fine-tune VideoMAE on MDPE face anti-spoofing dataset (video-level).
 Architecture: ViT encoder (per-clip) → cat features → per-clip-count Linear head
 
 Usage:
-    python run_mdpe_finetune.py \
-        --data_path F:/MDPEv1/cash/cache_cs224_fi20_afFalse/merged_foldf0_fi20.pt \
-        --finetune path/to/pretrained_videomae_base.pth \
-        --output_dir work_dir/mdpe
+    # Single GPU
+    python run_mdpe_finetune.py
+
+    # Dual GPU (DDP)
+    torchrun --nproc_per_node=2 run_mdpe_finetune.py
 """
 
 import argparse
 import collections
 import datetime
 import os
+import sys
 import time
 from functools import partial
-from math import cos, pi
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from timm.loss import LabelSmoothingCrossEntropy
 from timm.models import create_model
 from timm.utils import ModelEma
@@ -29,6 +33,7 @@ import wandb
 import models  # noqa: F401 - register models
 from dataset_mdpe import MDPEVideoDataset, video_collate_fn
 from optim_factory import LayerDecayValueAssigner, create_optimizer
+import utils
 
 
 def get_args():
@@ -36,7 +41,7 @@ def get_args():
 
     # Data
     p.add_argument("--data_path", type=str,
-                   default="F:/MDPEv1/cash/cache_cs224_fi20_afFalse/merged_foldf0_fi20.pt")
+                   default="/mnt/sda2/home/lrb/dataset/cache_cs224_fi20_afFalse/merged_foldf0_fi20.pt")
     p.add_argument("--clip_len", type=int, default=16)
 
     # Model
@@ -49,11 +54,11 @@ def get_args():
     p.add_argument("--head_drop_rate", type=float, default=0.5)
     p.add_argument("--nb_classes", type=int, default=2)
     p.add_argument("--use_mean_pooling", action="store_true", default=True)
-    p.add_argument("--with_checkpoint", action="store_true", default=False)
+    p.add_argument("--with_checkpoint", action="store_true", default=True)
     p.add_argument("--init_scale", default=0.001, type=float)
 
     # Pre-trained weights
-    p.add_argument("--finetune", default="vit_b_k710_dl_from_giant.pth", type=str)
+    p.add_argument("--finetune", default="/mnt/sda2/home/lrb/dataset/vit_b_k710_dl_from_giant.pth", type=str)
     p.add_argument("--model_key", default="model|module", type=str)
 
     # Optimizer
@@ -93,6 +98,13 @@ def get_args():
     p.add_argument("--resume", default="", type=str,
                    help="Path to last checkpoint to resume training from")
 
+    # Distributed
+    p.add_argument("--local_rank", default=-1, type=int)
+    p.add_argument("--dist_url", default="env://", type=str)
+    p.add_argument("--dist_on_itp", action="store_true", default=False)
+    p.add_argument("--nproc", default=1, type=int,
+                   help="Number of GPUs to use. -1 = auto detect all available GPUs")
+
     # WandB
     p.add_argument("--wandb_project", default="videomae-mdpe", type=str)
     p.add_argument("--wandb_entity", default="", type=str)
@@ -103,24 +115,12 @@ def get_args():
     return p.parse_args()
 
 
-def cosine_scheduler(base_val, final_val, epochs, niter_per_ep, warmup_epochs=0):
-    schedule = []
-    for epoch in range(epochs):
-        if epoch < warmup_epochs:
-            ratio = (epoch + 1) / warmup_epochs
-        else:
-            progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
-            ratio = final_val + 0.5 * (base_val - final_val) * (1 + cos(pi * progress))
-        schedule.extend([ratio] * niter_per_ep)
-    return schedule
-
-
 def load_pretrained(model, args):
     if not args.finetune:
         return
 
     print(f"Loading pre-trained weights from {args.finetune}")
-    checkpoint = torch.load(args.finetune, map_location="cpu")
+    checkpoint = torch.load(args.finetune, map_location="cpu", weights_only=False)
 
     ckpt = checkpoint
     for key in args.model_key.split("|"):
@@ -175,11 +175,12 @@ def load_pretrained(model, args):
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device, epoch,
-                    lr_schedule, wd_schedule, args, scaler):
+                    lr_schedule, wd_schedule, args, scaler, model_ema=None):
     model.train()
     total_loss, correct, total = 0, 0, 0
+    model_without_ddp = model.module if hasattr(model, 'module') else model
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    pbar = tqdm(loader, desc=f"Epoch {epoch}", disable=not utils.is_main_process())
     for step, (clips, labels, num_clips_list) in enumerate(pbar):
         clips = clips.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -194,17 +195,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch,
                 if pg["weight_decay"] > 0:
                     pg["weight_decay"] = wd_schedule[it]
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             outputs = model(clips, num_clips=num_clips_list)
             loss = criterion(outputs, labels)
 
-        optimizer.zero_grad()
         scaler.scale(loss).backward()
-        if args.clip_grad:
+        if args.clip_grad is not None:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+        else:
+            scaler.unscale_(optimizer)
         scaler.step(optimizer)
         scaler.update()
+        optimizer.zero_grad()
+
+        if model_ema is not None:
+            model_ema.update(model_without_ddp)
 
         total_loss += loss.item() * labels.size(0)
         preds = outputs.argmax(dim=1)
@@ -216,7 +222,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch,
             acc=f"{correct / total:.4f}",
             lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
-        if not args.no_wandb:
+        if not args.no_wandb and utils.is_main_process():
             wandb.log({
                 "train/loss_step": loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
@@ -231,66 +237,112 @@ def validate(model, loader, criterion, device):
     model.eval()
     total_loss, correct, total = 0, 0, 0
 
-    for clips, labels, num_clips_list in tqdm(loader, desc="Val"):
+    for clips, labels, num_clips_list in tqdm(loader, desc="Val", disable=not utils.is_main_process()):
         clips = clips.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        outputs = model(clips, num_clips=num_clips_list)
-        loss = criterion(outputs, labels)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            outputs = model(clips, num_clips=num_clips_list)
+            loss = criterion(outputs, labels)
 
         total_loss += loss.item() * labels.size(0)
         preds = outputs.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
 
-    return {"loss": total_loss / total, "acc": correct / total}
+    return {"loss": total_loss / total, "acc": correct / total,
+            "total_loss_raw": total_loss, "correct_raw": correct, "total_raw": total}
+
+
+class TeeLogger:
+    def __init__(self, log_path):
+        self.terminal = sys.stdout
+        self.log = open(log_path, "w", buffering=1)
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 
 def main():
     args = get_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device(args.device)
+    utils.init_distributed_mode(args)
 
-    # ---- WandB ----
-    if not args.no_wandb:
+    if utils.is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    device = torch.device(args.device)
+    seed = 42 + utils.get_rank()
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    import numpy as np
+    import random
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.benchmark = True
+
+    # ---- WandB (main process only) ----
+    if not args.no_wandb and utils.is_main_process():
+        wandb_name = args.wandb_name or (
+            f"vitb_lr{args.lr}_bs{args.batch_size}_ep{args.epochs}"
+            f"_dp{args.drop_path}_ld{args.layer_decay}")
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
-            name=args.wandb_name or None,
+            name=wandb_name,
             id=args.wandb_id or None,
             config=vars(args),
             resume="allow" if args.wandb_id else None,
         )
 
-    # ---- Load split info ----
-    print("Loading train/test split ...")
-    data = torch.load(args.data_path, map_location="cpu")
+    # ---- Load data (once, shared by train and val) ----
+    print(f"[Rank {utils.get_rank()}] Loading dataset ...")
+    data = torch.load(args.data_path, map_location="cpu", weights_only=False)
     train_idx = data["train_idx"]
     test_idx = data["test_idx"]
-    del data
 
     # ---- Dataset ----
     dataset_train = MDPEVideoDataset(
         args.data_path, clip_len=args.clip_len, mode="train",
-        train_idx=train_idx, test_idx=test_idx, args=args)
+        train_idx=train_idx, test_idx=test_idx, args=args,
+        cached_data=data)
     dataset_val = MDPEVideoDataset(
         args.data_path, clip_len=args.clip_len, mode="val",
-        train_idx=train_idx, test_idx=test_idx, args=args)
+        train_idx=train_idx, test_idx=test_idx, args=args,
+        cached_data=data)
+
+    if args.distributed:
+        sampler_train = DistributedSampler(
+            dataset_train, num_replicas=utils.get_world_size(),
+            rank=utils.get_rank(), shuffle=True)
+        sampler_val = DistributedSampler(
+            dataset_val, num_replicas=utils.get_world_size(),
+            rank=utils.get_rank(), shuffle=False)
+    else:
+        sampler_train = None
+        sampler_val = None
 
     loader_train = DataLoader(
-        dataset_train, batch_size=args.batch_size, shuffle=True,
+        dataset_train, batch_size=args.batch_size,
+        shuffle=(sampler_train is None),
         num_workers=args.num_workers, pin_memory=True,
         drop_last=True, collate_fn=video_collate_fn,
-        persistent_workers=True)
+        sampler=sampler_train,
+        persistent_workers=args.num_workers > 0)
     loader_val = DataLoader(
         dataset_val, batch_size=args.batch_size * 2, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
-        collate_fn=video_collate_fn,
-        persistent_workers=True)
+        collate_fn=video_collate_fn, sampler=sampler_val,
+        persistent_workers=args.num_workers > 0)
 
     # ---- Model ----
     all_clip_counts = sorted(dataset_train.clip_counts | dataset_val.clip_counts)
-    print(f"All clip counts across dataset: {all_clip_counts}")
+    if utils.is_main_process():
+        print(f"All clip counts across dataset: {all_clip_counts}")
 
     model = create_model(
         args.model,
@@ -310,49 +362,55 @@ def main():
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: {args.model}, params: {n_params / 1e6:.1f}M")
-    print(f"Video heads: {all_clip_counts}")
+    if utils.is_main_process():
+        print(f"Model: {args.model}, params: {n_params / 1e6:.1f}M")
+        print(f"Video heads: {all_clip_counts}")
 
     load_pretrained(model, args)
     model.to(device)
 
-    # EMA
+    if args.distributed:
+        model = DDP(model, device_ids=[args.gpu], find_unused_parameters=True)
+
+    # EMA (wraps the raw model, not DDP)
     model_ema = None
+    model_without_ddp = model.module if args.distributed else model
     if args.model_ema:
-        model_ema = ModelEma(model, decay=args.model_ema_decay)
+        model_ema = ModelEma(model_without_ddp, decay=args.model_ema_decay)
 
     # ---- Optimizer with layer-wise LR decay ----
-    num_layers = model.get_num_layers()
+    num_layers = model_without_ddp.get_num_layers()
     if args.layer_decay < 1.0:
         assigner = LayerDecayValueAssigner(
             list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
-        print(f"Layer decay: {assigner.values[:3]}...{assigner.values[-2:]}")
+        if utils.is_main_process():
+            print(f"Layer decay: {assigner.values[:3]}...{assigner.values[-2:]}")
     else:
         assigner = None
 
-    skip_wd = model.no_weight_decay()
+    skip_wd = model_without_ddp.no_weight_decay()
     optimizer = create_optimizer(
-        args, model,
+        args, model_without_ddp,
         skip_list=skip_wd,
         get_num_layer=assigner.get_layer_id if assigner else None,
         get_layer_scale=assigner.get_scale if assigner else None)
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
 
     # ---- Schedules ----
     niter = len(loader_train)
-    lr_schedule = cosine_scheduler(args.lr, args.min_lr, args.epochs, niter, args.warmup_epochs)
+    lr_schedule = utils.cosine_scheduler(args.lr, args.min_lr, args.epochs, niter, args.warmup_epochs)
     wd_end = args.weight_decay_end if args.weight_decay_end else args.weight_decay
-    wd_schedule = cosine_scheduler(args.weight_decay, wd_end, args.epochs, niter)
+    wd_schedule = utils.cosine_scheduler(args.weight_decay, wd_end, args.epochs, niter)
 
     # ---- Resume ----
     start_epoch = 0
     best_acc = 0.0
     if args.resume and os.path.isfile(args.resume):
         print(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        model_without_ddp.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
         if model_ema is not None and "model_ema" in ckpt:
@@ -362,24 +420,56 @@ def main():
         print(f"  Resume from epoch {start_epoch}, best_acc={best_acc:.4f}")
 
     # ---- Train ----
-    print(f"\nStart training: epoch {start_epoch}->{args.epochs}, {niter} iters/epoch")
+    if utils.is_main_process():
+        print(f"\nStart training: epoch {start_epoch}->{args.epochs}, {niter} iters/epoch, "
+              f"world_size={utils.get_world_size()}")
     start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
+        if args.distributed:
+            sampler_train.set_epoch(epoch)
+
         train_stats = train_one_epoch(
             model, loader_train, optimizer, criterion, device, epoch,
-            lr_schedule, wd_schedule, args, scaler)
+            lr_schedule, wd_schedule, args, scaler, model_ema)
 
         val_stats = validate(model, loader_val, criterion, device)
 
-        print(f"Epoch {epoch}: train_loss={train_stats['loss']:.4f} "
-              f"val_loss={val_stats['loss']:.4f} val_acc={val_stats['acc']:.4f}")
+        if args.distributed:
+            # Aggregate validation metrics across GPUs
+            val_loss_tensor = torch.tensor([val_stats["total_loss_raw"]]).to(device)
+            val_correct_tensor = torch.tensor([val_stats["correct_raw"]]).to(device)
+            val_total_tensor = torch.tensor([val_stats["total_raw"]]).to(device)
+            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_correct_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_total_tensor, op=dist.ReduceOp.SUM)
+            val_stats["loss"] = (val_loss_tensor / val_total_tensor).item()
+            val_stats["acc"] = (val_correct_tensor / val_total_tensor).item()
 
-        # Save best
-        if val_stats["acc"] > best_acc:
-            best_acc = val_stats["acc"]
+        if utils.is_main_process():
+            print(f"Epoch {epoch}: train_loss={train_stats['loss']:.4f} "
+                  f"val_loss={val_stats['loss']:.4f} val_acc={val_stats['acc']:.4f}")
+
+        # Save best & last (main process only)
+        if utils.is_main_process():
+            if val_stats["acc"] > best_acc:
+                best_acc = val_stats["acc"]
+                save_ckpt = {
+                    "model": model_without_ddp.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "epoch": epoch,
+                    "best_acc": best_acc,
+                }
+                if model_ema is not None:
+                    save_ckpt["model_ema"] = model_ema.ema.state_dict()
+                torch.save(save_ckpt,
+                           os.path.join(args.output_dir, "best_checkpoint.pth"))
+                print(f"  -> Best: {best_acc:.4f}")
+
+            last_path = os.path.join(args.output_dir, "last_checkpoint.pth")
             save_ckpt = {
-                "model": model.state_dict(),
+                "model": model_without_ddp.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
@@ -387,43 +477,74 @@ def main():
             }
             if model_ema is not None:
                 save_ckpt["model_ema"] = model_ema.ema.state_dict()
-            torch.save(save_ckpt,
-                       os.path.join(args.output_dir, "best_checkpoint.pth"))
-            print(f"  -> Best: {best_acc:.4f}")
+            torch.save(save_ckpt, last_path)
 
-        # Save last
-        last_path = os.path.join(args.output_dir, "last_checkpoint.pth")
-        save_ckpt = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "epoch": epoch,
-            "best_acc": best_acc,
-        }
-        if model_ema is not None:
-            save_ckpt["model_ema"] = model_ema.ema.state_dict()
-        torch.save(save_ckpt, last_path)
-
-        # EMA update
-        if model_ema is not None:
-            model_ema.update(model)
-
-        if not args.no_wandb:
+        if not args.no_wandb and utils.is_main_process():
             wandb.log({
                 "train/loss": train_stats["loss"],
                 "train/acc": train_stats["acc"],
                 "val/loss": val_stats["loss"],
                 "val/acc": val_stats["acc"],
                 "val/best_acc": best_acc,
-                "epoch": epoch,
-            }, step=epoch)
+            }, step=(epoch + 1) * niter - 1)
 
-    elapsed = str(datetime.timedelta(seconds=int(time.time() - start_time)))
-    print(f"Done in {elapsed}. Best val acc: {best_acc:.4f}")
+        if args.distributed:
+            dist.barrier()
 
-    if not args.no_wandb:
-        wandb.finish()
+    if utils.is_main_process():
+        elapsed = str(datetime.timedelta(seconds=int(time.time() - start_time)))
+        print(f"Done in {elapsed}. Best val acc: {best_acc:.4f}")
+
+        if not args.no_wandb:
+            wandb.finish()
 
 
 if __name__ == "__main__":
+    # Auto launch multi-GPU via torchrun if needed
+    nproc = 1  # default, will be overridden by --nproc arg
+    filtered_argv = []
+    skip_next = False
+    for i, arg in enumerate(sys.argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--nproc":
+            if i + 1 < len(sys.argv):
+                nproc = int(sys.argv[i + 1])
+                skip_next = True
+            continue
+        filtered_argv.append(arg)
+
+    world_size = int(os.environ.get("WORLD_SIZE", 0))
+    if world_size == 0:
+        if nproc == -1:
+            nproc = torch.cuda.device_count()
+        if nproc > 1:
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = "29500"
+            # Also capture torchrun output to log
+            output_dir = "work_dir/mdpe"
+            for i, arg in enumerate(filtered_argv):
+                if arg == "--output_dir" and i + 1 < len(filtered_argv):
+                    output_dir = filtered_argv[i + 1]
+                    break
+            os.makedirs(output_dir, exist_ok=True)
+            log_path = os.path.join(output_dir, "train_log.txt")
+            os.system(f"torchrun --nproc_per_node={nproc} " + " ".join(filtered_argv)
+                      + f" 2>&1 | tee {log_path}")
+            sys.exit(0)
+
+    # Set up logging for child processes (captures import warnings etc.)
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        output_dir = "work_dir/mdpe"
+        for i, arg in enumerate(filtered_argv):
+            if arg == "--output_dir" and i + 1 < len(filtered_argv):
+                output_dir = filtered_argv[i + 1]
+                break
+        os.makedirs(output_dir, exist_ok=True)
+        log_path = os.path.join(output_dir, "train_log.txt")
+        tee = TeeLogger(log_path)
+        sys.stdout = tee
+        sys.stderr = tee
+
     main()

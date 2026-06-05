@@ -12,10 +12,19 @@ from timm.optim.adafactor import Adafactor
 from timm.optim.adahessian import Adahessian
 from timm.optim.adamp import AdamP
 from timm.optim.lookahead import Lookahead
-from timm.optim.nadam import Nadam
-from timm.optim.novograd import NovoGrad
+try:
+    from timm.optim.nadam import Nadam
+except ImportError:
+    from torch.optim import NAdam as Nadam
+try:
+    from timm.optim.novograd import NovoGrad
+except ImportError:
+    NovoGrad = None
 from timm.optim.nvnovograd import NvNovoGrad
-from timm.optim.radam import RAdam
+try:
+    from timm.optim.radam import RAdam
+except ImportError:
+    from torch.optim import RAdam
 from timm.optim.rmsprop_tf import RMSpropTF
 from timm.optim.sgdp import SGDP
 from torch import optim as optim

@@ -89,6 +89,6 @@ def process_dataset(input_path, output_dir):
 
 
 if __name__ == "__main__":
-    input_path = r"F:\MDPEv1\cash\cache_cs224_fi20_afFalse\merged_foldf0_fi20.pt"
-    output_dir = r"E:\BaiduSyncdisk\videov2\VideoMAEv2\data"
+    input_path = "/mnt/sda2/home/lrb/dataset/cache_cs224_fi20_afFalse/merged_foldf0_fi20.pt"
+    output_dir = "/mnt/sda2/home/lrb/dataset/output_dir"
     process_dataset(input_path, output_dir)

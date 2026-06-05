@@ -346,7 +346,8 @@ class VisionTransformer(nn.Module):
                  use_mean_pooling=True,
                  with_cp=False,
                  cos_attn=False,
-                 clip_counts=None):
+                 clip_counts=None,
+                 **kwargs):
         super().__init__()
         self.num_classes = num_classes
         # num_features for consistency with other models
@@ -452,7 +453,7 @@ class VisionTransformer(nn.Module):
 
         for blk in self.blocks:
             if self.with_cp:
-                x = cp.checkpoint(blk, x)
+                x = cp.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
 

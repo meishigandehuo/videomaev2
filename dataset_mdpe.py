@@ -110,7 +110,8 @@ class MDPEVideoDataset(Dataset):
     """
 
     def __init__(self, data_path, clip_len=16, mode="train",
-                 train_idx=None, test_idx=None, args=None):
+                 train_idx=None, test_idx=None, args=None,
+                 cached_data=None):
         self.clip_len = clip_len
         self.mode = mode
 
@@ -121,11 +122,16 @@ class MDPEVideoDataset(Dataset):
             self.aa = "rand-m7-n4-mstd0.5-inc1"
             self.train_interpolation = "bicubic"
 
-        print(f"Loading {data_path} ...")
-        data = torch.load(data_path, map_location="cpu")
-        self.videos = data["videos"]
-        self.labels = data["labels"]
-        self.frame_counts = data["frame_counts"]
+        if cached_data is not None:
+            self.videos = cached_data["videos"]
+            self.labels = cached_data["labels"]
+            self.frame_counts = cached_data["frame_counts"]
+        else:
+            print(f"Loading {data_path} ...")
+            data = torch.load(data_path, map_location="cpu")
+            self.videos = data["videos"]
+            self.labels = data["labels"]
+            self.frame_counts = data["frame_counts"]
 
         video_indices = train_idx if mode == "train" else test_idx
 
